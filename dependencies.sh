@@ -146,10 +146,10 @@ if [ -d "yalantinglibs" ]; then
     check_success "Failed to remove existing yalantinglibs directory"
 fi
 
-# Clone yalantinglibs
-echo "Cloning yalantinglibs from ${GITHUB_PROXY}/alibaba/yalantinglibs.git"
-git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
-check_success "Failed to clone yalantinglibs"
+# # Clone yalantinglibs
+# echo "Cloning yalantinglibs from ${GITHUB_PROXY}/alibaba/yalantinglibs.git"
+# git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
+# check_success "Failed to clone yalantinglibs"
 
 # Build and install yalantinglibs
 cd yalantinglibs
@@ -174,6 +174,8 @@ cmake --install .
 check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
+
+exit
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
