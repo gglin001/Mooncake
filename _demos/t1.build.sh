@@ -8,13 +8,13 @@ args=(
   -DCMAKE_INSTALL_PREFIX="build/install"
   #
   -DUSE_HTTP=ON
-  -DUSE_REDIS=OFF
+  -DUSE_REDIS=ON
   #
   -DUSE_CUDA=OFF
   # -DUSE_NVMEOF=ON
   #
-  -DUSE_ETCD=OFF
-  -DWITH_STORE=OFF
+  -DUSE_ETCD=ON
+  -DWITH_STORE=ON
   #
   -S.
   -Bbuild
