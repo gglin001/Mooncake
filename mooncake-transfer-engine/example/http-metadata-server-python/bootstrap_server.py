@@ -29,6 +29,9 @@ class KVBootstrapServer:
     async def _handle_metadata(self, request: web.Request):
         key = request.query.get('key', '')
 
+        text = await request.text() 
+        print(f"_handle_metadata - {request.method} \n{text}")
+
         if request.method == 'GET':
             return await self._handle_get(key)
         elif request.method == 'PUT':
@@ -71,7 +74,7 @@ class KVBootstrapServer:
             self._runner = web.AppRunner(self.app)
             self._loop.run_until_complete(self._runner.setup())
             
-            site = web.TCPSite(self._runner, port=self.port)
+            site = web.TCPSite(self._runner, host="0.0.0.0", port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
         except Exception as e:
