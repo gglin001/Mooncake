@@ -2,7 +2,7 @@
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$PWD/build/mooncake-common/etcd
-PYTHON_VERSION="3.10" OUTPUT_DIR=dist bash ./scripts/build_wheel.sh
+bash ./scripts/build_wheel.sh "3.10" dist
 
 ###############################################################################
 
