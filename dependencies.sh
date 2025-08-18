@@ -116,6 +116,7 @@ SYSTEM_PACKAGES="build-essential \
                   libgrpc-dev \
                   libgrpc++-dev \
                   libprotobuf-dev \
+                  libyaml-cpp-dev \
                   protobuf-compiler-grpc \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
@@ -156,6 +157,11 @@ check_success "Failed to clone yalantinglibs"
 # Build and install yalantinglibs
 cd yalantinglibs
 check_success "Failed to change to yalantinglibs directory"
+
+# Checkout version 0.5.1
+echo "Checking out yalantinglibs version 0.5.1..."
+git checkout 0.5.1
+check_success "Failed to checkout yalantinglibs version 0.5.1"
 
 mkdir -p build
 check_success "Failed to create build directory"

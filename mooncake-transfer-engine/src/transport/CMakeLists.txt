@@ -19,7 +19,12 @@ if (USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
-if (USE_NVLINK)
+if (USE_ASCEND)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
+if (USE_MNNVL)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()

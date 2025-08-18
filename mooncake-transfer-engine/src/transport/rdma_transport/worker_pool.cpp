@@ -110,9 +110,12 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
+        auto hint = globalConfig().enable_dest_device_affinity
+                        ? context_.deviceName()
+                        : "";
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
                                         slice->rdma.dest_addr, slice->length,
-                                        buffer_id, device_id)) {
+                                        hint, buffer_id, device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -125,7 +128,7 @@ int WorkerPool::submitPostSend(
 
             if (RdmaTransport::selectDevice(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, buffer_id, device_id)) {
+                    slice->length, hint, buffer_id, device_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
@@ -228,7 +231,9 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->active()) {
-            context_.deleteEndpoint(entry.first);
+            if (endpoint->inactiveTime() > 1.0)
+                context_.deleteEndpoint(
+                    entry.first);  // enable for re-establishation
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -347,7 +352,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 
     for (auto &slice : slice_list) {
-        if (slice->rdma.retry_cnt == slice->rdma.max_retry_cnt) {
+        if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
@@ -439,7 +444,8 @@ void WorkerPool::monitorWorker() {
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {
-            PLOG(ERROR) << "Worker: epoll_wait()";
+            if (errno != EWOULDBLOCK && errno != EINTR)
+                PLOG(ERROR) << "Worker: epoll_wait()";
             continue;
         }
 

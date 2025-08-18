@@ -49,6 +49,7 @@ class Transport {
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+    using NotifyDesc = TransferMetadata::NotifyDesc;
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
@@ -90,6 +91,7 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
+        bool from_cache;
 
         union {
             struct {
@@ -114,10 +116,11 @@ class Transport {
                 const char *file_path;
             } nvmeof;
             struct {
-                void *remote_filename;
-                void *remote_addr;
-                size_t remote_offset;
+                void *dest_addr;
             } cxl;
+            struct {
+                uint64_t dest_addr;
+            } hccl;
         };
 
        public:
@@ -132,7 +135,7 @@ class Transport {
             __sync_fetch_and_add(&task->failed_slice_count, 1);
         }
 
-        volatile uint64_t ts;
+        volatile int64_t ts;
     };
 
     struct ThreadLocalSliceCache {
@@ -153,12 +156,18 @@ class Transport {
         }
 
         Slice *allocate() {
+            Slice *slice;
+
             if (head_ - tail_ == 0) {
                 allocated_++;
-                return new Slice();
+                slice = new Slice();
+                slice->from_cache = false;
+            } else {
+                slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
+                tail_++;
+                slice->from_cache = true;
             }
-            auto slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
-            tail_++;
+
             return slice;
         }
 
@@ -187,6 +196,8 @@ class Transport {
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
+        // record the origin request
+        const TransferRequest *request = nullptr;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -200,6 +211,7 @@ class Transport {
         size_t batch_size;
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
+        int64_t start_timestamp;
     };
 
    public:
@@ -218,7 +230,6 @@ class Transport {
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");

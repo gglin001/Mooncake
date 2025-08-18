@@ -4,26 +4,47 @@
 
 Mooncake Store is a high-performance **distributed key-value (KV) cache storage engine** designed specifically for LLM inference scenarios.
 
-Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the former, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
+Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be garbage collected).
 
-Mooncake Store provides low-level object storage and management capabilities, while specific caching strategies (e.g., eviction policies) are left to upper-layer frameworks (like vLLM) or users for implementation, offering higher flexibility and customizability.
+Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
-- **Eventual consistency**: Mooncake Store ensures that `Get` operations read complete and correct data, but does not guarantee the latest written data. This eventual consistency model ensures high performance while simplifying system design.
+- **Strong consistency**: Mooncake Store Guarantees that `Get` operations always read accurate and complete data, and after a successful write, all subsequent Gets will return the most recent value.
+- **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
-- **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management (to be refined in future versions).
+- **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
+- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
+- **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
 
-Mooncake Store is managed by a global **Master Service** responsible for allocating storage space pools. The specific allocation details are implemented by the `BufferAllocator` class, coordinated by the `AllocationStrategy` strategy class.
-
 ![architecture](../image/mooncake-store-preview.png)
 
-As shown in the figure above, there are two key components in Mooncake Store Preview:
-1. **Master Service**: Manages the logical storage space pool of the entire cluster and maintains node entry and exit. This is an independently running process that provides RPC services externally. Note that the metadata service required by the Transfer Engine (via etcd, Redis, or HTTP, etc.) is not included in the Master Service and needs to be deployed separately.
-2. **Client**: Shares a process with the vLLM instance (at least in the current version). Each Client is allocated a certain size of DRAM space, serving as part of the logical storage space pool. Therefore, data transfer is actually from one Client to another, bypassing the Master.
+As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
+
+**Master Service**: The `Master Service` orchestrates the logical storage space pool across the entire cluster, managing node join and leave events. It is responsible for object space allocation and metadata maintenance. Its memory allocation and eviction strategies are specifically designed and optimized to meet the demands of LLM inference workloads.
+
+The `Master Service` runs as an independent process and exposes RPC services to external components. Note that the `metadata service` required by the `Transfer Engine` (via etcd, Redis, or HTTP, etc.) is not included in the `Master Service` and needs to be deployed separately.
+
+**Client**: In Mooncake Store, the `Client` class is the only class defined to represent the client-side logic, but it serves **two distinct roles**:
+1. As a **client**, it is invoked by upper-layer applications to issue `Put`, `Get` and other requests.
+2. As a **store server**, it hosts a segment of contiguous memory that contributes to the distributed KV cache, making its memory available to other `Clients`. Data transfer is actually from one `Client` to another, bypassing the `Master Service`.
+
+It is possible to configure a `Client` instance to act in only one of its two roles:
+* If `global_segment_size` is set to zero, the instance functions as a **pure client**, issuing requests but not contributing memory to the system.
+* If `local_buffer_size` is set to zero, it acts as a **pure server**, providing memory for storage. In this case, request operations such as `Get` or `Put` are not permitted from this instance.
+
+The `Client` can be used in two modes:
+1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
+2. **Standalone mode**: Runs as an independent process.
+
+Mooncake store supports two deployment methods to accommodate different availability requirements:
+1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
+2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
+If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
+The leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
 ## Client C++ API
 
@@ -34,7 +55,7 @@ ErrorCode Init(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
                void** protocol_args,
-               const std::string& master_addr);
+               const std::string& master_server_entry);
 ```
 
 Initializes the Mooncake Store client. The parameters are as follows:
@@ -42,56 +63,46 @@ Initializes the Mooncake Store client. The parameters are as follows:
 - `metadata_connstring`: The address of the metadata service (e.g., etcd/Redis) required for Transfer Engine initialization
 - `protocol`: The protocol supported by the Transfer Engine, including RDMA and TCP
 - `protocol_args`: Protocol parameters required by the Transfer Engine
-- `master_addr`: The address information (`IP:Port`) of the Master
+- `master_server_entry`: The address information of the Master (`IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
 
 ### Get
 
 ```C++
-ErrorCode Get(const std::string& object_key, 
-              std::vector<Slice>& slices);
+tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+                                  std::vector<Slice>& slices);
 ```
 
 ![mooncake-store-simple-get](../image/mooncake-store-simple-get.png)
 
 
-Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.
+Used to retrieve the value corresponding to `object_key`. The retrieved data is guaranteed to be complete and correct. The retrieved value is stored in the memory region pointed to by `slices` via the Transfer Engine, which can be local DRAM/VRAM memory space registered in advance by the user through `registerLocalMemory(addr, len)`. Note that this is not the logical storage space pool (Logical Memory Pool) managed internally by Mooncake Store.​​(When persistence is enabled, if a query request fails in memory, the system will attempt to locate and load the corresponding data from SSD.)​
 
 > In the current implementation, the Get interface has an optional TTL feature. When the value corresponding to `object_key` is fetched for the first time, the corresponding entry is automatically deleted after a certain period of time (1s by default).
 
 ### Put
 
 ```C++
-ErrorCode Put(const ObjectKey& key,
-              std::vector<Slice>& slices,
-              const ReplicateConfig& config);
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
 ```
 
 ![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
-Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter. The data structure details of `ReplicateConfig` are as follows:
+Used to store the value corresponding to `key`. The required number of replicas can be set via the `config` parameter.​​​(When persistence is enabled, Put not only writes to the memory pool but also asynchronously initiates a data persistence operation to the SSD.)​ The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
-enum class MediaType {
-    VRAM,
-    RAM,
-    SSD
-};
-
-struct Location {
-    std::string segment_name;   // Segment Name within the Transfer Engine, usually the local_hostname field filled when the target server starts
-};
-
 struct ReplicateConfig {
-    uint64_t replica_num;       // Total number of replicas for the object
-    std::map<MediaType, int> media_replica_num; // Number of replicas allocated on a specific medium, with the higher value taken if the sum exceeds replica_num
-    std::vector<Location> locations; // Specific storage locations (machine and medium) for a replica
+    size_t replica_num{1};                    // Total number of replicas for the object
+    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
 
 ### Remove
 
 ```C++
-ErrorCode Remove(const ObjectKey& key);
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
@@ -256,14 +267,15 @@ message UnMountSegmentResponse {
 When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
 
 #### Object Information Maintenance
-The Master Service needs to maintain mappings related to `BufferAllocator` and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
+
+The Master Service needs to maintain mappings related to buffer allocators and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
 
 - MountSegment
 
 ```C++
-ErrorCode MountSegment(uint64_t buffer,
-                       uint64_t size,
-                       const std::string& segment_name);
+tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
+                                          uint64_t size,
+                                          const std::string& segment_name);
 ```
 
 The storage node (Client) registers the storage segment space with the Master Service.
@@ -271,7 +283,7 @@ The storage node (Client) registers the storage segment space with the Master Se
 - UnmountSegment
 
 ```C++
-ErrorCode UnmountSegment(const std::string& segment_name);
+tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
 ```
 
 The storage node (Client) unregisters the storage segment space with the Master Service.
@@ -304,30 +316,40 @@ The Client requests the Master Service to retrieve the replica list for a specif
 - Remove
 
 ```C++
-ErrorCode Remove(const std::string& key);
+tl::expected<void, ErrorCode> Remove(const std::string& key);
 ```
 
 The Client requests the Master Service to delete all replicas corresponding to the specified key.
 
 ### Buffer Allocator
 
-The BufferAllocator is a low-level space management class in the Mooncake Store system, primarily responsible for efficiently allocating and releasing memory. It leverages Facebook's CacheLib `MemoryAllocator` to manage underlying memory. When the Master Service receives a `MountSegment` request to register underlying space, it creates a `BufferAllocator` object via `AddSegment`. The main interfaces in the `BufferAllocator` class are as follows:
+The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
+
+Importantly, the memory managed by the buffer allocator does not reside within the `Master Service` itself. Instead, it operates on memory segments registered by `Clients`. When the `Master Service` receives a `MountSegment` request to register a contiguous memory region, it creates a corresponding buffer allocator via the `AddSegment` interface.
+
+Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
+
+**CachelibBufferAllocator**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios.
+
+**OffsetBufferAllocator**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation.
+
+Mooncake Store optimizes both allocators based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios. The allocators can be used interchangeably based on specific performance requirements and memory usage patterns. This is configurable via the startup parameter `--memory-allocator` of `master_service`.
+
+Both allocators implement the same interface as `BufferAllocatorBase`. The main interfaces of the `BufferAllocatorBase` class are as follows:
 
 ```C++
-class BufferAllocator {
-    BufferAllocator(SegmentName segment_name,
-                    size_t base,
-                    size_t size);
-    ~BufferAllocator();
-
-    std::shared_ptr<BufHandle> allocate(size_t size);
-    void deallocate(BufHandle* handle);
- };
+class BufferAllocatorBase {
+    virtual ~BufferAllocatorBase() = default;
+    virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
+    virtual void deallocate(AllocatedBuffer* handle) = 0;
+};
 ```
 
-1. Constructor: When creating a `BufferAllocator` instance, the upstream needs to pass the address and size of the instance space. Based on this information, the internal cachelib interface is called for unified management.
-2. `allocate` function: When the upstream has read/write requests, it needs to specify a region for the upstream to use. The `allocate` function calls the internal cachelib allocator to allocate memory and provides information such as the address and size of the space.
-3. `deallocate` function: Automatically called by the `BufHandle` destructor, which internally calls the cachelib allocator to release memory and sets the handle state to `BufStatus::UNREGISTERED`.
+1. **Constructor**: When a `BufferAllocator` instance is created, the upstream component must provide the base address and size of the memory region to be managed. This information is used to initialize the internal allocator, enabling unified memory management.
+
+2. **`allocate` Function**: When the upstream issues read or write requests, it needs a memory region to operate on. The `allocate` function invokes the internal allocator to reserve a memory block and returns metadata such as the starting address and size. The status of the newly allocated memory is initialized as `BufStatus::INIT`.
+
+3. **`deallocate` Function**: This function is automatically triggered by the `BufHandle` destructor. It calls the internal allocator to release the associated memory and updates the handle’s status to `BufStatus::UNREGISTERED`.
 
 ### AllocationStrategy
 AllocationStrategy is a strategy class for efficiently managing memory resource allocation and replica storage location selection in a distributed environment. It is mainly used in the following scenarios:
@@ -335,28 +357,39 @@ AllocationStrategy is a strategy class for efficiently managing memory resource 
 - Selecting suitable read/write paths among multiple replicas.
 - Providing decision support for resource load balancing between nodes in distributed storage.
 
-AllocationStrategy is used in conjunction with the Master Service and the underlying module BufferAllocator:
+AllocationStrategy is used in conjunction with the Master Service and the underlying buffer allocator:
 - Master Service: Determines the target locations for replica allocation via `AllocationStrategy`.
-- `BufferAllocator`: Executes the actual memory allocation and release tasks.
+- Buffer Allocator: Executes the actual memory allocation and release tasks.
 
 #### APIs
 
-1. `Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
+`Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
 
 ```C++
-virtual std::shared_ptr<BufHandle> Allocate(
-        const std::unordered_map<std::string, std::shared_ptr<BufferAllocator>>& allocators,
-        size_t objectSize) = 0;
+virtual std::unique_ptr<AllocatedBuffer> Allocate(
+        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
+        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
+        size_t objectSize, const ReplicateConfig& config) = 0;
 ```
 
-- Input: The list of available storage segments and the size of the space to be allocated.
-- Output: Returns a successful allocation handle BufHandle.
+- **Input Parameters**:
+  - `allocators`: A vector of all mounted buffer allocators
+  - `allocators_by_name`: A map of allocators organized by segment name for preferred segment allocation
+  - `objectSize`: The size of the object to be allocated
+  - `config`: Replica configuration including preferred segment and other allocation preferences
+- **Output**: Returns a unique pointer to an `AllocatedBuffer` if allocation succeeds, or `nullptr` if no suitable allocator is found
 
 #### Implementation Strategies
 
-`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy`, using a randomized approach to select a target from available storage segments. It supports setting a random seed to ensure deterministic allocation. In addition to random allocation, strategies can be defined based on actual needs, such as:
-- Load-based allocation strategy: Prioritizes low-load segments based on current load information of storage segments.
-- Topology-aware strategy: Prioritizes data segments that are physically closer to reduce network overhead.
+`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy` that provides intelligent allocation with the following features:
+
+1. **Preferred Segment Support**: If a preferred segment is specified in the `ReplicateConfig`, the strategy first attempts to allocate from that segment before falling back to random allocation.
+
+2. **Random Allocation with Retry Logic**: When multiple allocators are available, it uses a randomized approach with up to 10 retry attempts to find a suitable allocator.
+
+3. **Deterministic Randomization**: Uses a Mersenne Twister random number generator with proper seeding for consistent behavior.
+
+The strategy automatically handles cases where the preferred segment is unavailable, full, or doesn't exist by gracefully falling back to random allocation among all available segments.
 
 ### Eviction Policy
 
@@ -373,160 +406,90 @@ it initiates evict operations. The eviction target is to clean an additional `-e
 
 To avoid data conflicts, a per-object lease will be granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. An object is guaranteed to be protected from `Remove` request, `RemoveAll` request and `Eviction` task until its lease expires. A `Remove` request on a leased object will fail. A `RemoveAll` request will only remove objects without a lease.
 
-The default lease TTL is 200 ms and is configurable via a startup parameter of `master_service`.
+The default lease TTL is 5 seconds and is configurable via a startup parameter of `master_service`.
+
+### Soft Pin
+
+For important and frequently used objects, such as system prompts, Mooncake Store provides a soft pin mechanism. When putting an object, it can be configured to enable soft pin. During eviction, objects that are not soft pinned are prioritized for eviction. Soft pinned objects are only evicted when memory is insufficient and no other objects are eligible for eviction.
+
+If a soft pinned object is not accessed for an extended period, its soft pin status will be removed. If it is accessed again later, it will automatically be soft pinned once more.
+
+There are two startup parameters in `master_service` related to the soft pin mechanism:
+
+- `default_kv_soft_pin_ttl`: The duration (in milliseconds) after which a soft pinned object will have its soft pin status removed if not accessed. The default value is `30 minutes`.
+
+- `allow_evict_soft_pinned_objects`: Whether soft pinned objects are allowed to be evicted. The default value is `true`.
+
+Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
+
+### Preferred Segment Allocation
+
+Mooncake Store provides a **preferred segment allocation** feature that allows users to specify a preferred storage segment (node) for object allocation. This feature is particularly useful for optimizing data locality and reducing network overhead in distributed scenarios.
+
+#### How It Works
+
+The preferred segment allocation feature is implemented through the `AllocationStrategy` system and is controlled via the `preferred_segment` field in the `ReplicateConfig` structure:
+
+```cpp
+struct ReplicateConfig {
+    size_t replica_num{1};                    // Total number of replicas for the object
+    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    std::string preferred_segment{};         // Preferred segment for allocation
+};
+```
+
+When a `Put` operation is initiated with a non-empty `preferred_segment` value, the allocation strategy follows this process:
+
+1. **Preferred Allocation Attempt**: The system first attempts to allocate space from the specified preferred segment. If the preferred segment has sufficient available space, the allocation succeeds immediately.
+
+2. **Fallback to Random Allocation**: If the preferred segment is unavailable, full, or doesn't exist, the system automatically falls back to the standard random allocation strategy among all available segments.
+
+3. **Retry Logic**: The allocation strategy includes built-in retry mechanisms with up to 10 attempts to find suitable storage space across different segments.
+
+- **Data Locality**: By preferring local segments, applications can reduce network traffic and improve access performance for frequently used data.
+- **Load Balancing**: Applications can distribute data across specific nodes to achieve better load distribution.
+
+### Multi-layer Storage Support
+
+This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
+
+#### Enabling Persistence Functionality
+
+When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
+
+​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
+
+#### Data Access Mechanism
+
+The persistence feature also follows Mooncake Store's design principle of separating control flow from data flow. The read/write operations of kvcache objects are completed on the client side, while the query and management functions of kvcache objects are handled on the master side. In the file system, the key -> kvcache object index information is maintained by a fixed indexing mechanism, with each file corresponding to one kvcache object (the filename serves as the associated key name).
+
+After enabling the persistence feature:
+
+- For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
+- For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
+
+#### 3FS USRBIO Plugin
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](/mooncake-store/src/hf3fs/READMD.md).
 
 ## Mooncake Store Python API
 
-### setup
-```python
-def setup(
-    self,
-    local_hostname: str,
-    metadata_server: str,
-    global_segment_size: int = 16777216,  # 16MB
-    local_buffer_size: int = 16777216,    # 16MB
-    protocol: str = "tcp",
-    rdma_devices: str = "",
-    master_server_addr: str = "127.0.0.1:50051"
-) -> int
-```
-Initializes storage configuration and network parameters.
-
-**Parameters**  
-- `local_hostname`: Hostname/IP of local node
-- `metadata_server`: Address of metadata coordination server
-- `global_segment_size`: Shared memory segment size (default 16MB)
-- `local_buffer_size`: Local buffer allocation size (default 16MB)
-- `protocol`: Communication protocol ("tcp" or "rdma")
-- `rdma_devices`: RDMA device spec (format depends on implementation)
-- `master_server_addr`: Master server address (host:port format)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### initAll
-```python
-def initAll(
-    self,
-    protocol: str,
-    device_name: str,
-    mount_segment_size: int = 16777216  # 16MB
-) -> int
-```
-Initializes distributed resources and establishes connections.
-
-**Parameters**  
-- `protocol`: Network protocol to use ("tcp"/"rdma")
-- `device_name`: Hardware device identifier
-- `mount_segment_size`: Memory segment size for mounting (default 16MB)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### put
-```python
-def put(self, key: str, value: bytes) -> int
-```
-Stores a binary object in the distributed storage.
-
-**Parameters**  
-- `key`: Unique object identifier (string)
-- `value`: Binary data to store (bytes-like object)
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### get
-```python
-def get(self, key: str) -> bytes
-```
-Retrieves an object from distributed storage.
-
-**Parameters**  
-- `key`: Object identifier to retrieve
-
-**Returns**  
-- `bytes`: Retrieved binary data
-
-**Raises**  
-- `KeyError`: If specified key doesn't exist
-
----
-
-### remove
-```python
-def remove(self, key: str) -> int
-```
-Deletes an object from the storage system.
-
-**Parameters**  
-- `key`: Object identifier to remove
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
----
-
-### isExist
-```python
-def isExist(self, key: str) -> int
-```
-Checks object existence in the storage system.
-
-**Parameters**  
-- `key`: Object identifier to check
-
-**Returns**  
-- `int`: 
-  - `1`: Object exists
-  - `0`: Object doesn't exist
-  - `-1`: Error occurred
-
----
-
-### close
-```python
-def close(self) -> int
-```
-Cleans up all resources and terminates connections. Corresponds to `tearDownAll()`.
-
-**Returns**  
-- `int`: Status code (0 = success, non-zero = error)
-
-### Usage Example
-```python
-
-import mooncake_vllm_adaptor as mva
-store = mva.MooncakeDistributedStore()
-store.setup(
-    local_hostname="IP:port",
-    metadata_server="etcd://metadata server IP:port",
-    protocol="rdma",
-    ...
-)
-store.initAll(protocol="rdma", device_name="mlx5_0")
-
-# Store configuration
-store.put("kvcache1",  pickle.dumps(torch.Tensor(data)))
-
-# Retrieve data
-value = store.get("kvcache1")
-
-store.close()
-```
+**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
 
 ## Compilation and Usage
 Mooncake Store is compiled together with other related components (such as the Transfer Engine).
+
+For default mode:
 ```
-mkdir build
-cd build
-cmake ..
+mkdir build && cd build
+cmake .. # default mode
+make
+sudo make install # Install Python interface support package
+```
+
+High availability mode:
+```
+mkdir build && cd build
+cmake .. -DSTORE_USE_ETCD # compile etcd wrapper that depends on go
 make
 sudo make install # Install Python interface support package
 ```
@@ -543,10 +506,34 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+**High availability mode**:
+
+HA mode relies on an etcd service for coordination. If Transfer Engine also uses etcd as its metadata service, the etcd cluster used by Mooncake Store can either be shared with or separate from the one used by Transfer Engine.
+
+HA mode allows deployment of multiple master instances to eliminate the single point of failure. Each master instance must be started with the following parameters:
+```
+--enable-ha: enables high availability mode
+--etcd-endpoints: specifies endpoints for etcd service, separated by ';'
+--rpc-address: the RPC address of this instance
+```
+
+For example:
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-address=10.0.0.1
+```
+
 ### Starting the Sample Program
 Mooncake Store provides various sample programs, including interface forms based on C++ and Python. Below is an example of how to run using `stress_cluster_benchmark`.
 
-1. Open `stress_cluster_benchmark.py` and modify the initialization code according to the network situation, focusing on `local_hostname` (corresponding to the local machine IP address), `metadata_server` (corresponding to the Transfer Engine metadata service), `master_server_address` (corresponding to the Master Service address and port), etc.:
+1. Open `stress_cluster_benchmark.py` and update the initialization settings based on your network environment. Pay particular attention to the following fields:
+`local_hostname`: the IP address of the local machine
+`metadata_server`: the address of the Transfer Engine metadata service
+`master_server_address`: the address of the Master Service
+**Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
+For example: 
 ```python
 import os
 import time
@@ -585,12 +572,42 @@ retcode = store.setup(
 ```
 
 2. Run `ROLE=prefill python3 ./stress_cluster_benchmark.py` on one machine to start the Prefill node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=prefill MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
 
 3. Run `ROLE=decode python3 ./stress_cluster_benchmark.py` on another machine to start the Decode node.
-   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`
+   For "rdma" protocol, you can also enable topology auto discovery and filters, e.g., `ROLE=decode MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 ./stress_cluster_benchmark.py`.
 
-No error messages indicate successful data transfer.
+The absence of error messages indicates successful data transfer.
+
+### Starting the Client as Standalone Process
+
+Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start the `Client` as a standalone process.
+
+First, create and save a configuration file in JSON format. For example:
+
+```
+{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "global_segment_size": 268435456,
+    "local_buffer_size": 268435456,
+    "protocol": "tcp",
+    "device_name": "",
+    "master_server_address": "localhost:50051"
+}
+```
+
+Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
+
+The main startup parameters include:
+
+* `config`: Path to the configuration file.
+* `port`: Port number for the HTTP server.
+
+Suppose the `mooncake_transfer_engine` wheel package is already installed, the following command starts the program:
+```bash
+python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
+```
 
 ## Example Code
 

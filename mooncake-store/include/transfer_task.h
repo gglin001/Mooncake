@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,8 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "types.h"
+#include "storage_backend.h"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -22,8 +25,9 @@ namespace mooncake {
  * @brief Transfer strategy enumeration
  */
 enum class TransferStrategy {
-    LOCAL_MEMCPY = 0,    // Local memory copy using memcpy
-    TRANSFER_ENGINE = 1  // Remote transfer using transfer engine
+    LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
+    TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
+    FILE_READ = 2         // File read operation
 };
 
 /**
@@ -36,6 +40,8 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "LOCAL_MEMCPY";
         case TransferStrategy::TRANSFER_ENGINE:
             return os << "TRANSFER_ENGINE";
+        case TransferStrategy::FILE_READ:
+            return os << "FILE_READ";
         default:
             return os << "UNKNOWN";
     }
@@ -120,6 +126,32 @@ class MemcpyOperationState : public OperationState {
     }
 };
 
+class FilereadOperationState : public OperationState {
+   public:
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void set_completed(ErrorCode error_code) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            assert(!result_.has_value());
+            result_.emplace(error_code);
+        }
+        cv_.notify_all();
+    }
+
+    void wait_for_completion() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return result_.has_value(); });
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::FILE_READ;
+    }
+};
+
 /**
  * @brief Operation state for transfer engine operations
  */
@@ -127,10 +159,7 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {
-        CHECK(batch_id_ != Transport::INVALID_BATCH_ID)
-            << "Invalid batch ID for transfer engine operation";
-    }
+        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -260,6 +289,58 @@ class MemcpyWorkerPool {
 };
 
 /**
+ * @brief Fileread task for async execution
+ */
+struct FilereadTask {
+    std::string file_path;
+    size_t object_size;
+    std::vector<Slice> slices;
+    std::shared_ptr<FilereadOperationState> state;
+
+    FilereadTask(const std::string& path, size_t size,
+                 const std::vector<Slice>& slices_ref,
+                 std::shared_ptr<FilereadOperationState> s)
+        : file_path(path),
+          object_size(size),
+          slices(slices_ref),
+          state(std::move(s)) {}
+};
+
+/**
+ * @brief Thread pool for asynchronous memcpy operations
+ *
+ * This class manages a single worker thread that executes memcpy operations
+ * asynchronously.
+ */
+class FilereadWorkerPool {
+   public:
+    explicit FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend);
+    ~FilereadWorkerPool();
+
+    // Non-copyable, non-movable
+    FilereadWorkerPool(const FilereadWorkerPool&) = delete;
+    FilereadWorkerPool& operator=(const FilereadWorkerPool&) = delete;
+    FilereadWorkerPool(FilereadWorkerPool&&) = delete;
+    FilereadWorkerPool& operator=(FilereadWorkerPool&&) = delete;
+
+    /**
+     * @brief Submit a memcpy task for async execution
+     * @param task The memcpy task to execute
+     */
+    void submitTask(FilereadTask task);
+
+   private:
+    void workerThread();
+
+    std::vector<std::thread> workers_;
+    std::queue<FilereadTask> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> shutdown_;
+    std::shared_ptr<StorageBackend> backend_;
+};
+
+/**
  * @brief Submitter class for asynchronous transfer operations
  *
  * This class analyzes transfer requirements, selects optimal strategies, and
@@ -269,7 +350,9 @@ class MemcpyWorkerPool {
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
-                               const std::string& local_hostname);
+                               const std::string& local_hostname,
+                               std::shared_ptr<StorageBackend>& backend,
+                               TransferMetric* transfer_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -285,13 +368,16 @@ class TransferSubmitter {
      * failure
      */
     std::optional<TransferFuture> submit(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        Transport::TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
     const std::string local_hostname_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
+    std::unique_ptr<FilereadWorkerPool> fileread_pool_;
+    bool memcpy_enabled_;
+    TransferMetric* transfer_metric_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -326,6 +412,16 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+
+    std::optional<TransferFuture> submitFileReadOperation(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        Transport::TransferRequest::OpCode op_code);
+
+    /**
+     * @brief Calculate total bytes for transfer operation and update metrics
+     */
+    void updateTransferMetrics(const std::vector<Slice>& slices,
+                               Transport::TransferRequest::OpCode op);
 };
 
 }  // namespace mooncake

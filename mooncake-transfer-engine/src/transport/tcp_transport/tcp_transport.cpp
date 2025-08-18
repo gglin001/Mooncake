@@ -22,11 +22,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <random>
 
 #include "common.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
@@ -37,6 +44,16 @@ struct SessionHeader {
     uint64_t addr;
     uint8_t opcode;
 };
+
+#ifdef USE_CUDA
+static bool isCudaMemory(void *addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return false;
+    if (attributes.type == cudaMemoryTypeDevice) return true;
+    return false;
+}
+#endif
 
 struct Session : public std::enable_shared_from_this<Session> {
     explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
@@ -128,13 +145,30 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#ifdef USE_CUDA
+        if (isCudaMemory(addr)) {
+            dram_buffer = new char[buffer_size];
+            cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                       buffer_size, cudaMemcpyDefault);
+        }
+#endif
+
         asio::async_write(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, self](const asio::error_code &ec,
+                                            std::size_t transferred_bytes) {
+#ifdef USE_CUDA
+                if (isCudaMemory(addr)) {
+                    delete[] dram_buffer;
+                }
+#endif
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::writeBody failed. Error: " << ec.message()
+                        << "Session::writeBody failed. "
+                        << "Attempt to write data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -162,21 +196,42 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#ifdef USE_CUDA
+        bool is_cuda_memory = isCudaMemory(addr);
+        if (is_cuda_memory) {
+            dram_buffer = new char[buffer_size];
+        }
+#else
+        bool is_cuda_memory = false;
+#endif
+
         asio::async_read(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, is_cuda_memory, self](
+                const asio::error_code &ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::readBody failed. Error: " << ec.message()
+                        << "Session::readBody failed. "
+                        << "Attempt to read data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+#ifdef USE_CUDA
+                    if (is_cuda_memory) delete[] dram_buffer;
+#endif
                     session_mutex_.unlock();
                     return;
                 }
+#ifdef USE_CUDA
+                cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                           transferred_bytes, cudaMemcpyDefault);
+                if (is_cuda_memory) delete[] dram_buffer;
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -223,8 +278,15 @@ int TcpTransport::install(std::string &local_server_name,
                           std::shared_ptr<Topology> topo) {
     metadata_ = meta;
     local_server_name_ = local_server_name;
+    int sockfd = -1;
+    int tcp_port = findAvailableTcpPort(sockfd);
+    if (tcp_port == 0) {
+        LOG(ERROR) << "TcpTransport: unable to find available tcp port for "
+                      "data transmission";
+        return -1;
+    }
 
-    int ret = allocateLocalSegmentID();
+    int ret = allocateLocalSegmentID(tcp_port);
     if (ret) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
         return -1;
@@ -237,7 +299,7 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    int tcp_port = meta->localRpcMeta().rpc_port + 1;
+    close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
     running_ = true;
@@ -245,11 +307,12 @@ int TcpTransport::install(std::string &local_server_name,
     return 0;
 }
 
-int TcpTransport::allocateLocalSegmentID() {
+int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
     desc->protocol = "tcp";
+    desc->tcp_data_port = tcp_data_port;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -347,11 +410,12 @@ Status TcpTransport::submitTransfer(
 }
 
 Status TcpTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
@@ -405,7 +469,7 @@ void TcpTransport::startTransfer(Slice *slice) {
         }
         auto endpoint_iterator =
             resolver.resolve(asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
-                             std::to_string(meta_entry.rpc_port + 1));
+                             std::to_string(desc->tcp_data_port));
         asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {

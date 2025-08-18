@@ -1,6 +1,11 @@
 # 编译指南
 
-本文档叙述了 Mooncake 框架的编译方法。
+本文档叙述了 Mooncake 框架的源码编译安装方法。
+
+- 注意: 我们已经为 Ubuntu 22.04/24.04 预先构建了 pypi 安装包，您可以使用 pip/pip3 以更简单的方式安装和使用 mooncake。
+   ```bash
+   pip3 install mooncake-transfer-engine --upgrade
+   ```
 
 ## 自动安装
 
@@ -113,10 +118,12 @@
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
-- `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，注意 go 1.23+
+- `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: 启用 Rust 支持
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
+- `-DUSE_ETCD=[ON|OFF]`: 启用基于 etcd 的元数据服务，需要 go 1.23+
+- `-DSTORE_USE_ETCD=[ON|OFF]`: 启用基于 etcd 的 Mooncake Store 容错机制，需要 go 1.23+
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON

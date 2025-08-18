@@ -37,6 +37,7 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
+pip install torch numpy
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
@@ -46,6 +47,11 @@ echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
 echo "Success: mooncake_master entry point found"
+
+echo "Verifying transfer_engine_bench entry point..."
+# Check if the transfer_engine_bench entry point is installed and executable
+which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
+echo "Success: transfer_engine_bench entry point found"
 
 cd ..
 

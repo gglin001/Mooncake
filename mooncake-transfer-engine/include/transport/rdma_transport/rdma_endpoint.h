@@ -73,9 +73,15 @@ class RdmaEndPoint {
 
     bool active() const { return active_; }
 
-    void set_active(bool flag) { 
+    void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag; 
+        active_ = flag;
+        if (!flag) inactive_time_ = getCurrentTimeInNano();
+    }
+
+    double inactiveTime() {
+        if (active_) return 0.0;
+        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
    public:
@@ -104,6 +110,9 @@ class RdmaEndPoint {
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
 
+    // Get the number of QPs in this endpoint
+    size_t getQPNumber() const;
+
    private:
     std::vector<uint32_t> qpNum() const;
 
@@ -129,6 +138,7 @@ class RdmaEndPoint {
 
     volatile bool active_;
     volatile int *cq_outstanding_;
+    volatile uint64_t inactive_time_;
 };
 
 }  // namespace mooncake

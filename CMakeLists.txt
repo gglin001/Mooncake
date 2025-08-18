@@ -4,6 +4,8 @@ project(mooncake CXX C)
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
 
+include(mooncake-common/FindJsonCpp.cmake)
+include(mooncake-common/FindGLOG.cmake)
 include(mooncake-common/common.cmake)
 # unit test
 if (BUILD_UNIT_TESTS)
@@ -22,7 +24,6 @@ execute_process(
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
-
 if (USE_ETCD)
   add_compile_definitions(USE_ETCD)
   if (USE_ETCD_LEGACY)
@@ -32,15 +33,20 @@ if (USE_ETCD)
     message(STATUS "etcd as metadata server support is enabled (go package)")
   endif()
 endif()
+option(STORE_USE_ETCD "build mooncake store with etcd" OFF)
+if (STORE_USE_ETCD)
+  add_compile_definitions(STORE_USE_ETCD)
+endif()
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
+include_directories(mooncake-common/include)
 
 add_subdirectory(mooncake-transfer-engine)
 include_directories(mooncake-transfer-engine/include)
 
 if (WITH_STORE)
-  message(STATUS "Mooncake Store will be build")
+  message(STATUS "Mooncake Store will be built")
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()
@@ -49,5 +55,5 @@ add_subdirectory(mooncake-integration)
 
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
-  message(STATUS "P2P Store will be build")
+  message(STATUS "P2P Store will be built")
 endif()

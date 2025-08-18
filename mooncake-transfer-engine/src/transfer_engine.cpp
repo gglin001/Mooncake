@@ -17,13 +17,35 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+
+static bool setFilesLimit() {
+    struct rlimit filesLimit;
+    if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "getrlimit failed: " << strerror(errno);
+        return false;
+    }
+    rlim_t target_limit = filesLimit.rlim_max;
+    // Skip if already sufficient
+    if (filesLimit.rlim_cur >= target_limit) {
+        return true;
+    }
+    filesLimit.rlim_cur = target_limit;
+    if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
+        LOG(ERROR) << "setrlimit failed: " << strerror(errno);
+        return false;
+    }
+    return true;
+}
 
 static std::string loadTopologyJsonFile(const std::string &path) {
     std::ifstream file(path);
@@ -46,30 +68,59 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << ", ip_or_host_name: " << ip_or_host_name
               << ", rpc_port: " << rpc_port;
 
-    local_server_name_ = local_server_name;
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
+
+    if (!setFilesLimit()) {
+        LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
+                        "initialization, but this may cause issues if too many "
+                        "files are opened.";
+    }
+    // Set resources to the maximum value
+
+#ifdef USE_ASCEND
+    // The only difference in initializing the Ascend Transport is that the
+    // `local_server_name` must include the physical NPU card ID. The format
+    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
+    // While the desc_name stored in the metadata remains in the format of
+    // ip:port.
+    int devicePhyId = -1;
+    auto [host_name, port] =
+        parseHostNameWithPortAscend(local_server_name, &devicePhyId);
+    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: "
+              << host_name << " port: " << port
+              << " devicePhyId: " << devicePhyId;
+    local_server_name_ = host_name + ":" + std::to_string(port);
+#else
+    auto [host_name, port] = parseHostNameWithPort(local_server_name);
+    LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: "
+              << host_name << " port: " << port;
+    local_server_name_ = local_server_name;
+#endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
         metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
-        auto [host_name, port] = parseHostNameWithPort(local_server_name);
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
 
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            if (port == getDefaultHandshakePort()) {
-                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-                if (desc.rpc_port == 0) {
-                    LOG(ERROR)
-                        << "P2P: No valid port found for local TCP service.";
-                    return -1;
-                }
+            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            if (desc.rpc_port == 0) {
+                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                return -1;
             }
+#ifdef USE_ASCEND
+            // The current version of Ascend Transport does not support IPv6,
+            // but it will be added in a future release.
             local_server_name_ =
                 desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
+#else
+            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
+                                 std::to_string(desc.rpc_port);
+#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -102,11 +153,37 @@ int TransferEngine::init(const std::string &metadata_conn_string,
               << desc.rpc_port;
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+#ifdef USE_ASCEND
+    std::string mutable_server_name =
+        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
+    multi_transports_ =
+        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
+#else
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-
+#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
+
+#ifdef USE_ASCEND
+    Transport *ascend_transport =
+        multi_transports_->installTransport("ascend", local_topology_);
+    if (!ascend_transport) {
+        LOG(ERROR) << "Failed to install Ascend transport";
+        return -1;
+    }
+#else
+
+#if defined(USE_CXL) && !defined(USE_ASCEND)
+    if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
+        Transport *cxl_transport =
+            multi_transports_->installTransport("cxl", local_topology_);
+        if (!cxl_transport) {
+            LOG(ERROR) << "Failed to install CXL transport";
+            return -1;
+        }
+    }
+#endif
 
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
@@ -127,18 +204,45 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
-        if (local_topology_->getHcaList().size() > 0) {
-            // only install RDMA transport when there is at least one HCA
-            multi_transports_->installTransport("rdma", local_topology_);
+#ifdef USE_MNNVL
+        if (local_topology_->getHcaList().size() > 0 &&
+            !getenv("MC_FORCE_MNNVL")) {
+            Transport *rdma_transport =
+                multi_transports_->installTransport("rdma", local_topology_);
+            if (!rdma_transport) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
         } else {
-#ifdef USE_NVLINK
-            multi_transports_->installTransport("nvlink", nullptr);
-#else
-            multi_transports_->installTransport("tcp", nullptr);
-#endif
+            Transport *nvlink_transport =
+                multi_transports_->installTransport("nvlink", nullptr);
+            if (!nvlink_transport) {
+                LOG(ERROR) << "Failed to install NVLink transport";
+                return -1;
+            }
         }
+#else
+        if (local_topology_->getHcaList().size() > 0 &&
+            !getenv("MC_FORCE_TCP")) {
+            // only install RDMA transport when there is at least one HCA
+            Transport *rdma_transport =
+                multi_transports_->installTransport("rdma", local_topology_);
+            if (!rdma_transport) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
+        } else {
+            Transport *tcp_transport =
+                multi_transports_->installTransport("tcp", nullptr);
+            if (!tcp_transport) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+        }
+#endif
         // TODO: install other transports automatically
     }
+#endif
 
     return 0;
 }
@@ -194,6 +298,26 @@ std::string TransferEngine::getLocalIpAndPort() {
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
+int TransferEngine::getNotifies(
+    std::vector<TransferMetadata::NotifyDesc> &notifies) {
+    return metadata_->getNotifies(notifies);
+}
+
+int TransferEngine::sendNotifyByID(SegmentID target_id,
+                                   TransferMetadata::NotifyDesc notify_msg) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
+    return ret;
+}
+
+int TransferEngine::sendNotifyByName(std::string remote_agent,
+                                     TransferMetadata::NotifyDesc notify_msg) {
+    Transport::NotifyDesc peer_desc;
+    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
+    return ret;
+}
+
 Transport::SegmentHandle TransferEngine::openSegment(
     const std::string &segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
@@ -234,6 +358,11 @@ int TransferEngine::registerLocalMemory(void *addr, size_t length,
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
+    }
+    if (length == 0) {
+        LOG(ERROR)
+            << "Transfer Engine does not support zero length memory region";
+        return ERR_INVALID_ARGUMENT;
     }
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->registerLocalMemory(

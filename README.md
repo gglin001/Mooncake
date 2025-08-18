@@ -8,6 +8,7 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
 </div>
 <br/>
 
@@ -17,6 +18,7 @@ This repository also hosts its technical report and the open sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+ - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmdeploy-integration-v0.9.md) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
  - **May 8, 2025**: Mooncake x LMCache <a href="doc/en/lmcache-integration.md" target="_blank">unite</a> to pioneer KVCache-centric LLM serving system.
  - **May 5, 2025**: Supported by Mooncake Team, SGLang release <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/" target="_blank">guidance</a> to deploy DeepSeek with PD Disaggregation on 96 H100 GPUs.
@@ -52,6 +54,9 @@ Both P2P Store and Mooncake Store are built on the Transfer Engine and provide k
 
 **Mooncake Integration with Leading LLM Inference Systems**  
 Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
+
+**Elastic Expert Parallelism Support (Work in Progress)**
+Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
@@ -139,13 +144,13 @@ pip install mooncake-transfer-engine
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
 
 ### Build and use binaries
-The following are additional dependencies of building Mooncake:
+The following are additional dependencies for building Mooncake:
 - Build essentials, including gcc, g++ (9.4+) and cmake (3.16+).
-- Go 1.20+, if you want to build with `-DWITH_P2P_STORE` or `-DUSE_ETCD` (enabled by default). 
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is build with `-DUSE_CUDA` . *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- [Optional] Rust Toolclain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS`, so that you use Redis instead of etcd as metadata servers.
-- [Optional] `curl`, if you want to build with `-DUSE_HTTP`, so that you use HTTP instead of etcd as metadata servers.
+- Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
+- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+- [Optional] Rust Toolchain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
+- [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
 The building and installation steps are the following:
 1. Retrieve source code from GitHub repo

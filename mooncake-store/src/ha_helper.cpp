@@ -1,4 +1,6 @@
 #include "ha_helper.h"
+#include "etcd_helper.h"
+#include "rpc_service.h"
 
 namespace mooncake {
 
@@ -90,37 +92,28 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
 }
 
 MasterServiceSupervisor::MasterServiceSupervisor(
-    int port, int server_thread_num, bool enable_gc,
-    bool enable_metric_reporting, int metrics_port,
-    int64_t default_kv_lease_ttl, double eviction_ratio,
-    double eviction_high_watermark_ratio, const std::string& etcd_endpoints,
-    const std::string& local_hostname)
-    : port_(port),
-      server_thread_num_(server_thread_num),
-      enable_gc_(enable_gc),
-      enable_metric_reporting_(enable_metric_reporting),
-      metrics_port_(metrics_port),
-      default_kv_lease_ttl_(default_kv_lease_ttl),
-      eviction_ratio_(eviction_ratio),
-      eviction_high_watermark_ratio_(eviction_high_watermark_ratio),
-      etcd_endpoints_(etcd_endpoints),
-      local_hostname_(local_hostname) {}
+    const MasterServiceSupervisorConfig& config)
+    : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
         LOG(INFO) << "Init master service...";
-        coro_rpc::coro_rpc_server server(server_thread_num_, port_);
+        coro_rpc::coro_rpc_server server(
+            config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
+            config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
         LOG(INFO) << "Init leader election helper...";
         MasterViewHelper mv_helper;
-        if (mv_helper.ConnectToEtcd(etcd_endpoints_) != ErrorCode::OK) {
+        if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to etcd endpoints: "
-                       << etcd_endpoints_;
+                       << config_.etcd_endpoints;
             return -1;
         }
         LOG(INFO) << "Trying to elect self as leader...";
-        ViewVersionId version = 0;
         EtcdLeaseId lease_id = 0;
-        mv_helper.ElectLeader(local_hostname_, version, lease_id);
+        // view_version will be updated by ElectLeader and then used in
+        // WrappedMasterService
+        ViewVersionId view_version = 0;
+        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
@@ -137,9 +130,7 @@ int MasterServiceSupervisor::Start() {
 
         LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
-            enable_gc_, default_kv_lease_ttl_, enable_metric_reporting_,
-            metrics_port_, eviction_ratio_, eviction_high_watermark_ratio_,
-            version);
+            mooncake::WrappedMasterServiceConfig(config_, view_version));
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

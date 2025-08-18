@@ -1,6 +1,11 @@
 # Build Guide
 
-This document describes how to build Mooncake.
+This document describes how to build Mooncake from source.
+
+- Note: we have prebuild the pypi wheel for Ubuntu 22.04/24.04, you can simply install mooncake with pip/pip3.
+   ```bash
+   pip3 install mooncake-transfer-engine --upgrade
+   ```
 
 ## Automatic
 
@@ -26,8 +31,6 @@ This document describes how to build Mooncake.
    ```bash
    sudo make install
    ```
-
-Note: If you plan to use Mooncake Store with vLLM, you need to have the package `mooncake_vllm_adaptor` installed in your active python library. You can verify if the package exists by running `python -c "import mooncake_vllm_adaptor"`. If the package is missing, you can manually copy the built shared library into your python library directory (e.g. `cp ./build/mooncake-integration/mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so .venv/lib/python3.10/site-packages/`)
 
 ## Manual
 
@@ -131,10 +134,12 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
-- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, note go 1.23+
+- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
 - `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
+- `-DUSE_ETCD=[ON|OFF]`: Enable etcd-based metadata service, require go 1.23+
+- `-DSTORE_USE_ETCD=[ON|OFF]`: Enable etcd-based failover for Mooncake Store, require go 1.23+
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON

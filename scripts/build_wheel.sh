@@ -15,30 +15,48 @@ echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
-echo "Creating directory structure..."
+echo "Cleaning wheel-build directory"
+rm -rf mooncake-wheel/mooncake_transfer_engine*
+rm -rf mooncake-wheel/build/
+rm -f mooncake-wheel/mooncake/*.so
 
-echo "Copying Python modules..."
-# Copy mooncake_vllm_adaptor to root level for backward compatibility
-cp build/mooncake-integration/mooncake_vllm_adaptor.*.so mooncake-wheel/mooncake/mooncake_vllm_adaptor.so
+echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy engine.so to mooncake directory (will be imported by transfer module)
-cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
-
-# Copy nvlink-hook.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-hook/hook.so ]; then
-    echo "Copying CUDA nvlink-hook.so..."
-    cp build/mooncake-transfer-engine/nvlink-hook/hook.so mooncake-wheel/mooncake/hook.so
+# Copy store.so to mooncake directory
+if [ -f build/mooncake-integration/store.*.so ]; then
+    echo "Copying store.so..."
+    cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    echo "Copying master binary..."
+    # Copy master binary
+    cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
 else
-    echo "Skipping nvlink-hook.so (not built - likely ARM64 or non-CUDA build)"
+    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
-echo "Copying master binary and shared libraries..."
-# Copy master binary and shared libraries
-cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+# Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    echo "Copying CUDA nvlink_allocator.so..."
+    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+    echo "Copying allocator libraries..."
+    # Copy allocator.py
+    cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+else
+    echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
+fi
 
+echo "Copying transfer_engine_bench..."
+# Copy transfer_engine_bench
+cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+
+if [ -f "build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
+    cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
+    echo "Copying ascend_transport_mem libraries..."
+else
+    echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
+fi
 
 echo "Building wheel package..."
 # Build the wheel package
@@ -112,6 +130,36 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 --exclude libffi.so* \
 --exclude libcuda.so* \
 --exclude libcudart.so* \
+--exclude libascendcl.so* \
+--exclude libhccl.so* \
+--exclude libmsprofiler.so* \
+--exclude libgert.so* \
+--exclude libascendcl_impl.so* \
+--exclude libge_executor.so* \
+--exclude libascend_dump.so* \
+--exclude libgraph.so* \
+--exclude libruntime.so* \
+--exclude libascend_watchdog.so* \
+--exclude libprofapi.so* \
+--exclude liberror_manager.so* \
+--exclude libascendalog.so* \
+--exclude libc_sec.so* \
+--exclude libhccl_alg.so* \
+--exclude libhccl_plf.so* \
+--exclude libascend_protobuf.so* \
+--exclude libhybrid_executor.so* \
+--exclude libdavinci_executor.so* \
+--exclude libge_common.so* \
+--exclude libge_common_base.so* \
+--exclude liblowering.so* \
+--exclude libregister.so* \
+--exclude libexe_graph.so* \
+--exclude libmmpa.so* \
+--exclude libplatform.so* \
+--exclude libgraph_base.so* \
+--exclude libruntime_common.so* \
+--exclude libqos_manager.so* \
+--exclude libascend_trace.so* \
 -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 

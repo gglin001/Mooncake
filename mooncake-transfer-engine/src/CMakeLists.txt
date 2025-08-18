@@ -1,5 +1,3 @@
-find_package(jsoncpp REQUIRED)
-
 file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
@@ -47,4 +45,11 @@ if (USE_CUDA)
   if (USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
+endif()
+
+if (USE_ASCEND)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  link_directories(${ASCEND_LIB_DIR})
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()

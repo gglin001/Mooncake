@@ -124,6 +124,30 @@ class TransferEngine {
         return multi_transports_->submitTransfer(batch_id, entries);
     }
 
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest> &entries,
+                                    TransferMetadata::NotifyDesc notify_msg) {
+        auto target_id = entries[0].target_id;
+        Status s = multi_transports_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            return s;
+        }
+
+        // store notify
+        RWSpinlock::WriteGuard guard(send_notifies_lock_);
+        notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+
+        return s;
+    }
+
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
+
+    int sendNotifyByID(SegmentID target_id,
+                       TransferMetadata::NotifyDesc notify_msg);
+
+    int sendNotifyByName(std::string remote_agent,
+                         TransferMetadata::NotifyDesc notify_msg);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
         Status result =
@@ -135,7 +159,39 @@ class TransferEngine {
             }
         }
 #endif
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            if (!notifies_to_send_.count(batch_id)) return result;
+            auto value = notifies_to_send_[batch_id];
+            sendNotifyByID(value.first, value.second);
+            notifies_to_send_.erase(batch_id);
+        }
         return result;
+    }
+
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+        Status result =
+            multi_transports_->getBatchTransferStatus(batch_id, status);
+#ifdef WITH_METRICS
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes > 0) {
+                transferred_bytes_counter_.inc(status.transferred_bytes);
+            }
+        }
+#endif
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            // send notify
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            if (!notifies_to_send_.count(batch_id)) return result;
+            auto value = notifies_to_send_[batch_id];
+            sendNotifyByID(value.first, value.second);
+            notifies_to_send_.erase(batch_id);
+        }
+        return result;
+    }
+
+    Transport *getTransport(const std::string &proto) {
+        return multi_transports_->getTransport(proto);
     }
 
     int syncSegmentCache(const std::string &segment_name = "") {
@@ -146,9 +202,7 @@ class TransferEngine {
 
     bool checkOverlap(void *addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) {
-        auto_discover_ = auto_discover;
-    }
+    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
     void setWhitelistFilters(std::vector<std::string> &&filters) {
         filter_ = std::move(filters);
@@ -156,6 +210,10 @@ class TransferEngine {
 
     int numContexts() const {
         return (int)local_topology_->getHcaList().size();
+    }
+
+    std::shared_ptr<Topology> getLocalTopology() const {
+        return local_topology_;
     }
 
    private:
@@ -172,6 +230,12 @@ class TransferEngine {
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
+
+    RWSpinlock send_notifies_lock_;
+    std::unordered_map<BatchID,
+                       std::pair<SegmentID, TransferMetadata::NotifyDesc>>
+        notifies_to_send_;
+
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;

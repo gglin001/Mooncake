@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "multi_transport.h"
-#include "config.h"
+#include <string>
 
+#include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
@@ -23,8 +24,14 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
-#ifdef USE_NVLINK
+#ifdef USE_ASCEND
+#include "transport/ascend_transport/hccl_transport/hccl_transport.h"
+#endif
+#ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
+#ifdef USE_CXL
+#include "transport/cxl_transport/cxl_transport.h"
 #endif
 
 #include <cassert>
@@ -78,11 +85,9 @@ Status MultiTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    struct SubmitTasks {
-        std::vector<TransferRequest *> request_list;
-        std::vector<Transport::TransferTask *> task_list;
-    };
-    std::unordered_map<Transport *, SubmitTasks> submit_tasks;
+
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+        submit_tasks;
     for (auto &request : entries) {
         Transport *transport = nullptr;
         auto status = selectTransport(request, transport);
@@ -90,15 +95,13 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.request = &request;
         ++task_id;
-        submit_tasks[transport].request_list.push_back(
-            (TransferRequest *)&request);
-        submit_tasks[transport].task_list.push_back(&task);
+        submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second.request_list,
-                                                      entry.second.task_list);
+        auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
@@ -130,7 +133,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         if (globalConfig().slice_timeout > 0) {
             auto current_ts = getCurrentTimeInNano();
-            const int64_t kPacketDeliveryTimeout = 
+            const int64_t kPacketDeliveryTimeout =
                 globalConfig().slice_timeout * 1000000000;
             for (auto &slice : task.slice_list) {
                 auto ts = slice->ts;
@@ -144,6 +147,42 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         status.s = Transport::TransferStatusEnum::WAITING;
     }
+    return Status::OK();
+}
+
+Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
+                                              TransferStatus &status) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    const size_t task_count = batch_desc.task_list.size();
+    status.transferred_bytes = 0;
+
+    if (task_count == 0) {
+        status.s = Transport::TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    size_t success_count = 0;
+    for (size_t task_id = 0; task_id < task_count; task_id++) {
+        TransferStatus task_status;
+        auto ret = getTransferStatus(batch_id, task_id, task_status);
+
+        if (!ret.ok()) {
+            status.s = Transport::TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+
+        if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
+            status.transferred_bytes += task_status.transferred_bytes;
+            success_count++;
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+            status.s = Transport::TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+    }
+
+    status.s = (success_count == task_count)
+                   ? Transport::TransferStatusEnum::COMPLETED
+                   : Transport::TransferStatusEnum::WAITING;
     return Status::OK();
 }
 
@@ -163,9 +202,19 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new NVMeoFTransport();
     }
 #endif
-#ifdef USE_NVLINK
+#ifdef USE_ASCEND
+    else if (std::string(proto) == "ascend") {
+        transport = new HcclTransport();
+    }
+#endif
+#ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
+    }
+#endif
+#ifdef USE_CXL
+    else if (std::string(proto) == "cxl") {
+        transport = new CxlTransport();
     }
 #endif
 
@@ -188,7 +237,7 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
-                                       entry.target_id);
+                                       std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
     if (!transport_map_.count(proto)) {
