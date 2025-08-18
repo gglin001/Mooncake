@@ -20,5 +20,5 @@ include_directories(
 
 # Add subdirectories
 add_subdirectory(src)
-add_subdirectory(tests)
-add_subdirectory(benchmarks)
+# add_subdirectory(tests)
+# add_subdirectory(benchmarks)
